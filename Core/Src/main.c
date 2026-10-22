@@ -32,35 +32,47 @@
 #include "scha63x.h"
 #include "app_rtos.h"
 #include "app_tasks.h"
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <stdbool.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-/* Vehicle CAN standard IDs */
-#define CAN_ID_STEER_WHL_AG  0x040U  /* SteerWhlAgSafe */
-#define CAN_ID_WHL_FRNT      0x1A0U  /* WhlSpdCircumlFrntLe / FrntRi */
-#define CAN_ID_WHL_REAR      0x1C0U  /* WhlSpdCircumlReLe / ReRi */
-#define CAN_ID_VEH_SPD_LGT   0x0E0U  /* VehSpdLgtSafe */
-#define CAN_ID_GEAR_LVR      0x120U  /* GearLvrIndcn */
+#define CAN_ID_STEER_WHL_AG      (0x040U)
+#define CAN_ID_WHL_FRNT          (0x1A0U)
+#define CAN_ID_WHL_REAR          (0x1C0U)
+#define CAN_ID_VEH_SPD_LGT       (0x0E0U)
+#define CAN_ID_GEAR_LVR          (0x120U)
+#define GRODO_CAN_UPDATES_MIN    ((uint8_t)5)
+#define CAN_SPEED_SCALE          (0.00391f)
+#define NMEA_SENTENCE_CAP        (160U)
+#define NMEA_PREFIX_CAP          (16U)
+#define UNIX_EPOCH_YEAR          (INT64_C(1970))
+#define DAYS_PER_YEAR            (INT64_C(365))
+#define SECONDS_PER_DAY          (INT64_C(86400))
+#define SECONDS_PER_HOUR         (INT64_C(3600))
+#define SECONDS_PER_MINUTE       (INT64_C(60))
+#define BEIJING_UTC_OFFSET_H     (INT64_C(8))
+#define STAMP_U32_MAX            (INT64_C(4294967295))
+#define CAN_BYTE_GEAR            ((uint8_t)0)
+#define CAN_BYTE_STEER           ((uint8_t)1)
+#define CAN_BYTE_WHL_FL          ((uint8_t)1)
+#define CAN_BYTE_WHL_RL          ((uint8_t)3)
+#define CAN_BYTE_WHL_FR          ((uint8_t)5)
+#define CAN_BYTE_WHL_RR          ((uint8_t)7)
+#define CAN_BYTE_VEH_SPD         ((uint8_t)5)
+#define NMEA_FIELD_TIME          ((uint8_t)1)
+#define NMEA_FIELD_DATE          ((uint8_t)9)
+#define UART_TX_TIMEOUT_MS       (0xFFFFU)
 
-#define GRODO_CAN_UPDATES_MIN  5U    /* one update from each handled ID above */
-
-static scha63x_raw_data_summed scha63x_data_summed_raw;
-
-scha63x_raw_data scha63x_raw_data_last;
-int status;
-
-typedef struct {
-  float veh_speed;   /* longitudinal vehicle speed (m/s scaled on bus) */
-  float gear;        /* gear lever indication (raw, scale per DBC) */
-  float steer;       /* steering wheel angle (raw, scale per DBC) */
-  float whl_ft_l;    /* front left wheel circumferential speed */
-  float whl_ft_r;    /* front right wheel circumferential speed */
-  float whl_rr_l;    /* rear left wheel circumferential speed */
-  float whl_rr_r;    /* rear right wheel circumferential speed */
+typedef struct
+{
+  float veh_speed;
+  float gear;
+  float steer;
+  float whl_ft_l;
+  float whl_ft_r;
+  float whl_rr_l;
+  float whl_rr_r;
 } vehicle_can_payload_t;
 /* USER CODE END PTD */
 
@@ -70,286 +82,717 @@ typedef struct {
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-uint8_t CheckXOR(char *pbuff)
-{
-  uint8_t tmp = 0;
-
-  if (pbuff == NULL || pbuff[0] != '$')
-  {
-    return 0;
-  }
-
-  for (int i = 1; i < 200 && pbuff[i] != '\0'; i++)
-  {
-    if (pbuff[i] == '*')
-    {
-      return tmp;
-    }
-    tmp ^= (uint8_t)pbuff[i];
-  }
-  return 0;
-}
-
-
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-#ifdef __GNUC__
-#define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
-#else
-#define PUTCHAR_PROTOTYPE int fputc(int ch, FILE *f)
-#endif
-PUTCHAR_PROTOTYPE
-{
-  HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 0xFFFF);
-  return ch;
-}
-RTC_DateTypeDef sdatestructure;
-RTC_TimeTypeDef stimestructure;
-
-static const uint16_t monDays[12] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
-
-/* RTC holds Beijing (UTC+8) civil time; output is Unix seconds (UTC). */
-uint32_t time2Stamp(RTC_DateTypeDef date, RTC_TimeTypeDef time)
-{
-  double result;
-  uint16_t year = (uint16_t)(date.Year + 2000U);
-
-  if (date.Month < 1U || date.Month > 12U)
-  {
-    return 0U;
-  }
-
-  result = (year - 1970U) * 365.0 * 24.0 * 3600.0
-         + (monDays[date.Month - 1U] + date.Date - 1U) * 24.0 * 3600.0
-         + ((int32_t)time.Hours - 8) * 3600.0 + time.Minutes * 60.0 + time.Seconds;
-  result += (date.Month > 2U && ((year % 4U) == 0U) && ((year % 100U) != 0U || (year % 400U) == 0U)) * 24.0 * 3600.0;
-  year -= 1969U;
-  result += ((year / 4U) - (year / 100U) + (year / 400U)) * 24.0 * 3600.0;
-
-  return (uint32_t)result;
-}
-
-FDCAN_RxHeaderTypeDef RxHeader;
-uint8_t RxData[8];
-void FDCAN1_Config(void);
+static RTC_DateTypeDef sdatestructure;
+static RTC_TimeTypeDef stimestructure;
+static double rtc_unix_sec = 0.0;
+static double imu_time_offset = 0.0;
+static double time_ms = 0.0;
+static uint8_t can_update_count = (uint8_t)0;
+static scha63x_real_data scha63x_data;
+static vehicle_can_payload_t vehicle_data;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
-static void sync_rtc_from_usart3(void);
+static uint8_t ascii_hex(uint8_t nibble);
+static void append_char(uint8_t *dst, uint32_t cap, uint32_t *pos, uint8_t ch);
+static void nmea_begin(uint8_t *dst, uint32_t cap, uint32_t *pos, const char *prefix);
+static void append_fixed3(uint8_t *dst, uint32_t cap, uint32_t *pos, double value);
+static double f64_from_float(float value);
+static void append_float_field(uint8_t *dst, uint32_t cap, uint32_t *pos, double value, bool last);
+static uint8_t nmea_checksum(const uint8_t *sentence);
+static void log_nmea(uint8_t *sentence, uint32_t cap, uint32_t pos);
+static void log_cstring(const char *text);
+static float u8_scaled(uint8_t raw);
+static float u8_as_float(uint8_t raw);
+static void note_can_update(void);
+static uint8_t parse_two_digits(const uint8_t *src);
+static uint32_t time2Stamp(const RTC_DateTypeDef *date, const RTC_TimeTypeDef *time);
+static void usart3_forward_to_uart2(uint8_t *frame, uint16_t len);
+static void sync_rtc_from_usart3(const uint8_t *frame, uint16_t len);
+static void handle_usart3_frame(void);
 static void vehicle_can_handle_frame(uint32_t can_id, const uint8_t *payload);
 static void publish_grodo_sentence(void);
 static void publish_grimu_sentence(void);
+static void imu_sample_and_publish(void);
+static void FDCAN1_ConfigFilter(uint32_t index, uint32_t id);
+static void FDCAN1_Config(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-static char rx4_time[4];
-static char imu_field[8][20];
-static char grodo_field[7][16];
-static char grimu_sentence[130];
-static char grodo_sentence[130];
 
-static double rtc_unix_sec = 0.0;
-static double imu_time_offset = 0.0;
-static double time_ms = 0.0;
-static uint8_t xor_byte = 0;
-static int nmea_field_index = 0;
-static int can_update_count = 0;
-
-static scha63x_real_data scha63x_data;
-static vehicle_can_payload_t vehicle_data;
-
-static void copy_two_digits(char *dest, const uint8_t *src)
+static uint8_t ascii_hex(uint8_t nibble)
 {
-  dest[0] = (char)src[0];
-  dest[1] = (char)src[1];
-  dest[2] = '\0';
+  static const uint8_t hex_chars[16] =
+  {
+    (uint8_t)'0', (uint8_t)'1', (uint8_t)'2', (uint8_t)'3',
+    (uint8_t)'4', (uint8_t)'5', (uint8_t)'6', (uint8_t)'7',
+    (uint8_t)'8', (uint8_t)'9', (uint8_t)'a', (uint8_t)'b',
+    (uint8_t)'c', (uint8_t)'d', (uint8_t)'e', (uint8_t)'f'
+  };
+  uint8_t index;
+  uint8_t ch;
+
+  index = nibble;
+  if (index > (uint8_t)15)
+  {
+    index = (uint8_t)0;
+  }
+  ch = hex_chars[index];
+  return ch;
 }
 
-static void usart3_forward_to_uart2(void)
+static void append_char(uint8_t *dst, uint32_t cap, uint32_t *pos, uint8_t ch)
 {
-  uint16_t len = USART3_RxFrameLen;
+  uint32_t index;
 
-  if (len > 0U)
+  if ((dst != NULL) && (pos != NULL))
   {
-    (void)HAL_UART_Transmit(&huart2, USART3_Buff, len, 0xFFFF);
-    (void)HAL_UART_Transmit(&huart2, (uint8_t *)"\r\n", 2, 0xFFFF);
+    index = *pos;
+    if ((index + 1U) < cap)
+    {
+      dst[index] = ch;
+      index++;
+      dst[index] = 0U;
+      *pos = index;
+    }
   }
 }
 
-static void sync_rtc_from_usart3(void)
+static void nmea_begin(uint8_t *dst, uint32_t cap, uint32_t *pos, const char *prefix)
 {
-  nmea_field_index = 0;
-  for (int idx = 0; idx < 100 && USART3_Buff[idx] != '\0'; idx++)
+  uint32_t i;
+  char ch;
+  uint8_t byte;
+  bool stop;
+
+  if (pos != NULL)
   {
-    if (USART3_Buff[idx] != ',')
-    {
-      continue;
-    }
-    nmea_field_index++;
-    if (nmea_field_index == 1 && (idx + 6) < (int)sizeof(USART3_Buff))
-    {
-      copy_two_digits(rx4_time, &USART3_Buff[idx + 1]);
-      stimestructure.Hours = (uint8_t)atoi(rx4_time);
-      copy_two_digits(rx4_time, &USART3_Buff[idx + 3]);
-      stimestructure.Minutes = (uint8_t)atoi(rx4_time);
-      copy_two_digits(rx4_time, &USART3_Buff[idx + 5]);
-      stimestructure.Seconds = (uint8_t)atoi(rx4_time);
-    }
-    else if (nmea_field_index == 9 && (idx + 6) < (int)sizeof(USART3_Buff))
-    {
-      copy_two_digits(rx4_time, &USART3_Buff[idx + 1]);
-      sdatestructure.Date = (uint8_t)atoi(rx4_time);
-      copy_two_digits(rx4_time, &USART3_Buff[idx + 3]);
-      sdatestructure.Month = (uint8_t)atoi(rx4_time);
-      copy_two_digits(rx4_time, &USART3_Buff[idx + 5]);
-      sdatestructure.Year = (uint8_t)atoi(rx4_time);
-    }
+    *pos = 0U;
+  }
+  if ((dst != NULL) && (cap > 0U))
+  {
+    dst[0] = 0U;
   }
 
-  if (osMutexWait(g_telemetryMutex, osWaitForever) != osOK)
+  stop = false;
+  if (prefix != NULL)
   {
-    return;
+    for (i = 0U; i < NMEA_PREFIX_CAP; i++)
+    {
+      if (stop == false)
+      {
+        ch = prefix[i];
+        if (ch == '\0')
+        {
+          stop = true;
+        }
+        else
+        {
+          byte = (uint8_t)ch;
+          append_char(dst, cap, pos, byte);
+        }
+      }
+    }
+  }
+}
+
+static void append_fixed3(uint8_t *dst, uint32_t cap, uint32_t *pos, double value)
+{
+  uint64_t scaled;
+  uint64_t whole;
+  uint64_t digit;
+  uint32_t frac;
+  uint32_t n;
+  uint32_t part;
+  double mag;
+  double scaled_d;
+  uint8_t digits[20];
+  uint8_t d8;
+  bool negative;
+
+  negative = false;
+  mag = value;
+  if (mag < 0.0)
+  {
+    negative = true;
+    mag = -mag;
+  }
+  if (mag != mag)
+  {
+    mag = 0.0;
+    negative = false;
   }
 
-  if (sdatestructure.Year != 0U)
+  scaled_d = (mag * 1000.0) + 0.5;
+  if (scaled_d > 1000000000000000.0)
   {
-    HAL_RTC_SetTime(&hrtc, &stimestructure, RTC_FORMAT_BIN);
-    HAL_RTC_SetDate(&hrtc, &sdatestructure, RTC_FORMAT_BIN);
+    scaled_d = 1000000000000000.0;
+  }
+  scaled = (uint64_t)scaled_d;
+  if (scaled == 0ULL)
+  {
+    negative = false;
+  }
+
+  whole = scaled / 1000ULL;
+  digit = scaled % 1000ULL;
+  frac = (uint32_t)digit;
+
+  if (negative == true)
+  {
+    append_char(dst, cap, pos, (uint8_t)'-');
+  }
+
+  n = 0U;
+  if (whole == 0ULL)
+  {
+    d8 = (uint8_t)0;
+    digits[0] = ascii_hex(d8);
+    n = 1U;
   }
   else
   {
-    HAL_RTC_GetTime(&hrtc, &stimestructure, RTC_FORMAT_BIN);
-    HAL_RTC_GetDate(&hrtc, &sdatestructure, RTC_FORMAT_BIN);
+    while ((whole > 0ULL) && (n < 20U))
+    {
+      digit = whole % 10ULL;
+      whole /= 10ULL;
+      d8 = (uint8_t)digit;
+      digits[n] = ascii_hex(d8);
+      n++;
+    }
   }
 
-  imu_time_offset = 0.0;
-  rtc_unix_sec = (double)time2Stamp(sdatestructure, stimestructure);
-  time_ms = rtc_unix_sec + imu_time_offset;
-  USART3_Receive_Flag = false;
-  (void)osMutexRelease(g_telemetryMutex);
+  while (n > 0U)
+  {
+    n--;
+    append_char(dst, cap, pos, digits[n]);
+  }
+
+  append_char(dst, cap, pos, (uint8_t)'.');
+  part = frac / 100U;
+  d8 = (uint8_t)part;
+  append_char(dst, cap, pos, ascii_hex(d8));
+  part = (frac / 10U) % 10U;
+  d8 = (uint8_t)part;
+  append_char(dst, cap, pos, ascii_hex(d8));
+  part = frac % 10U;
+  d8 = (uint8_t)part;
+  append_char(dst, cap, pos, ascii_hex(d8));
+}
+
+static double f64_from_float(float value)
+{
+  double out;
+
+  out = (double)value;
+  return out;
+}
+
+static void append_float_field(uint8_t *dst, uint32_t cap, uint32_t *pos, double value, bool last)
+{
+  uint8_t sep;
+
+  append_fixed3(dst, cap, pos, value);
+  if (last == true)
+  {
+    sep = (uint8_t)'*';
+  }
+  else
+  {
+    sep = (uint8_t)',';
+  }
+  append_char(dst, cap, pos, sep);
+}
+
+static uint8_t nmea_checksum(const uint8_t *sentence)
+{
+  uint32_t acc;
+  uint32_t i;
+  uint8_t byte;
+  bool started;
+  bool found_star;
+  bool stop;
+
+  acc = 0U;
+  started = false;
+  found_star = false;
+  stop = false;
+  i = 0U;
+
+  if (sentence != NULL)
+  {
+    while ((i < NMEA_SENTENCE_CAP) && (stop == false))
+    {
+      byte = sentence[i];
+      if (byte == 0U)
+      {
+        stop = true;
+      }
+      else if (byte == (uint8_t)'$')
+      {
+        started = true;
+      }
+      else if (byte == (uint8_t)'*')
+      {
+        found_star = true;
+        stop = true;
+      }
+      else if (started == true)
+      {
+        acc ^= (uint32_t)byte;
+      }
+      else
+      {
+        /* Bytes before '$' are not part of the checksum. */
+      }
+      i++;
+    }
+  }
+
+  if ((started == false) || (found_star == false))
+  {
+    acc = 0U;
+  }
+  return (uint8_t)acc;
+}
+
+static void log_nmea(uint8_t *sentence, uint32_t cap, uint32_t pos)
+{
+  uint8_t sum;
+  uint32_t sum_u;
+  uint32_t nibble;
+  uint8_t hi;
+  uint8_t lo;
+
+  sum = nmea_checksum(sentence);
+  sum_u = (uint32_t)sum;
+  nibble = sum_u >> 4U;
+  nibble &= 0x0FU;
+  hi = (uint8_t)nibble;
+  nibble = sum_u & 0x0FU;
+  lo = (uint8_t)nibble;
+  append_char(sentence, cap, &pos, ascii_hex(hi));
+  append_char(sentence, cap, &pos, ascii_hex(lo));
+  append_char(sentence, cap, &pos, (uint8_t)'\r');
+  append_char(sentence, cap, &pos, (uint8_t)'\n');
+  if (pos <= 0xFFFFU)
+  {
+    App_LogWrite(sentence, (uint16_t)pos);
+  }
+}
+
+static void log_cstring(const char *text)
+{
+  uint8_t buf[40];
+  uint32_t i;
+  uint32_t n;
+  uint32_t cap;
+  char ch;
+  bool stop;
+
+  n = 0U;
+  stop = false;
+  cap = sizeof(buf);
+  if (text != NULL)
+  {
+    for (i = 0U; i < cap; i++)
+    {
+      if (stop == false)
+      {
+        ch = text[i];
+        if (ch == '\0')
+        {
+          stop = true;
+        }
+        else
+        {
+          buf[n] = (uint8_t)ch;
+          n++;
+        }
+      }
+    }
+  }
+
+  if ((n > 0U) && (n <= 0xFFFFU))
+  {
+    App_LogWrite(buf, (uint16_t)n);
+  }
+}
+
+static float u8_scaled(uint8_t raw)
+{
+  float value;
+
+  value = (float)raw;
+  value = value * CAN_SPEED_SCALE;
+  return value;
+}
+
+static float u8_as_float(uint8_t raw)
+{
+  float value;
+
+  value = (float)raw;
+  return value;
+}
+
+static void note_can_update(void)
+{
+  if (can_update_count < (uint8_t)255)
+  {
+    can_update_count++;
+  }
+}
+
+static uint8_t parse_two_digits(const uint8_t *src)
+{
+  uint8_t hi;
+  uint8_t lo;
+  uint8_t value;
+  uint32_t acc;
+  bool digits;
+
+  value = (uint8_t)0;
+  digits = false;
+  if (src != NULL)
+  {
+    hi = src[0];
+    lo = src[1];
+    if ((hi >= (uint8_t)'0') && (hi <= (uint8_t)'9') &&
+        (lo >= (uint8_t)'0') && (lo <= (uint8_t)'9'))
+    {
+      digits = true;
+    }
+    if (digits == true)
+    {
+      acc = (uint32_t)hi;
+      acc -= (uint32_t)'0';
+      acc *= 10U;
+      acc += (uint32_t)lo;
+      acc -= (uint32_t)'0';
+      value = (uint8_t)acc;
+    }
+  }
+  return value;
+}
+
+static uint32_t time2Stamp(const RTC_DateTypeDef *date, const RTC_TimeTypeDef *time)
+{
+  static const uint16_t mon_days[12] =
+  {
+    (uint16_t)0, (uint16_t)31, (uint16_t)59, (uint16_t)90,
+    (uint16_t)120, (uint16_t)151, (uint16_t)181, (uint16_t)212,
+    (uint16_t)243, (uint16_t)273, (uint16_t)304, (uint16_t)334
+  };
+  uint32_t result;
+  uint32_t year_full;
+  uint32_t month_index;
+  uint32_t leaps;
+  uint16_t mdays;
+  uint8_t month = (uint8_t)0;
+  uint8_t day;
+  uint8_t hour_u8;
+  uint8_t min_u8;
+  uint8_t sec_u8;
+  uint8_t year_u8;
+  int64_t stamp;
+  int64_t yday;
+  int64_t hours;
+  int64_t mins;
+  int64_t secs;
+  int64_t leap_days;
+  int64_t year_i;
+  bool is_leap;
+  bool valid;
+
+  result = 0U;
+  valid = false;
+  if ((date != NULL) && (time != NULL))
+  {
+    month = date->Month;
+    if ((month >= (uint8_t)1) && (month <= (uint8_t)12))
+    {
+      valid = true;
+    }
+  }
+
+  if (valid == true)
+  {
+    year_u8 = date->Year;
+    year_full = (uint32_t)year_u8;
+    year_full += 2000U;
+    month_index = (uint32_t)month;
+    month_index -= 1U;
+
+    stamp = (int64_t)year_full;
+    stamp -= UNIX_EPOCH_YEAR;
+    stamp *= DAYS_PER_YEAR;
+    stamp *= SECONDS_PER_DAY;
+
+    mdays = mon_days[month_index];
+    day = date->Date;
+    yday = (int64_t)mdays;
+    yday += (int64_t)day;
+    yday -= INT64_C(1);
+    yday *= SECONDS_PER_DAY;
+    stamp += yday;
+
+    hour_u8 = time->Hours;
+    hours = (int64_t)hour_u8;
+    hours -= BEIJING_UTC_OFFSET_H;
+    stamp += hours * SECONDS_PER_HOUR;
+
+    min_u8 = time->Minutes;
+    mins = (int64_t)min_u8;
+    stamp += mins * SECONDS_PER_MINUTE;
+
+    sec_u8 = time->Seconds;
+    secs = (int64_t)sec_u8;
+    stamp += secs;
+
+    is_leap = false;
+    if (((year_full % 4U) == 0U) &&
+        (((year_full % 100U) != 0U) || ((year_full % 400U) == 0U)))
+    {
+      is_leap = true;
+    }
+    if ((month > (uint8_t)2) && (is_leap == true))
+    {
+      stamp += SECONDS_PER_DAY;
+    }
+
+    leaps = year_full - 1969U;
+    year_i = (int64_t)leaps;
+    leap_days = year_i / INT64_C(4);
+    leap_days -= year_i / INT64_C(100);
+    leap_days += year_i / INT64_C(400);
+    leap_days *= SECONDS_PER_DAY;
+    stamp += leap_days;
+
+    if ((stamp >= INT64_C(0)) && (stamp <= STAMP_U32_MAX))
+    {
+      result = (uint32_t)stamp;
+    }
+  }
+
+  return result;
+}
+
+static void usart3_forward_to_uart2(uint8_t *frame, uint16_t len)
+{
+  uint8_t crlf[2];
+
+  if ((frame != NULL) && (len > (uint16_t)0))
+  {
+    crlf[0] = (uint8_t)'\r';
+    crlf[1] = (uint8_t)'\n';
+    (void)HAL_UART_Transmit(&huart2, frame, len, UART_TX_TIMEOUT_MS);
+    (void)HAL_UART_Transmit(&huart2, crlf, (uint16_t)2, UART_TX_TIMEOUT_MS);
+  }
+}
+
+static void sync_rtc_from_usart3(const uint8_t *frame, uint16_t len)
+{
+  uint16_t idx;
+  uint32_t end_index;
+  uint32_t at;
+  uint32_t need;
+  uint8_t field;
+  uint8_t year;
+
+  field = (uint8_t)0;
+  if (frame != NULL)
+  {
+    for (idx = (uint16_t)0; idx < len; idx++)
+    {
+      if (frame[idx] == (uint8_t)',')
+      {
+        if (field < (uint8_t)255)
+        {
+          field++;
+        }
+        end_index = (uint32_t)idx;
+        end_index += 6U;
+        need = (uint32_t)len;
+        if ((field == NMEA_FIELD_TIME) && (end_index < need))
+        {
+          at = (uint32_t)idx;
+          at += 1U;
+          stimestructure.Hours = parse_two_digits(&frame[at]);
+          at += 2U;
+          stimestructure.Minutes = parse_two_digits(&frame[at]);
+          at += 2U;
+          stimestructure.Seconds = parse_two_digits(&frame[at]);
+        }
+        else if ((field == NMEA_FIELD_DATE) && (end_index < need))
+        {
+          at = (uint32_t)idx;
+          at += 1U;
+          sdatestructure.Date = parse_two_digits(&frame[at]);
+          at += 2U;
+          sdatestructure.Month = parse_two_digits(&frame[at]);
+          at += 2U;
+          sdatestructure.Year = parse_two_digits(&frame[at]);
+        }
+        else
+        {
+          /* Other CSV fields are not used for RTC sync. */
+        }
+      }
+    }
+  }
+
+  if (osMutexWait(g_telemetryMutex, osWaitForever) == osOK)
+  {
+    year = sdatestructure.Year;
+    if (year != (uint8_t)0)
+    {
+      (void)HAL_RTC_SetTime(&hrtc, &stimestructure, RTC_FORMAT_BIN);
+      (void)HAL_RTC_SetDate(&hrtc, &sdatestructure, RTC_FORMAT_BIN);
+    }
+    else
+    {
+      (void)HAL_RTC_GetTime(&hrtc, &stimestructure, RTC_FORMAT_BIN);
+      (void)HAL_RTC_GetDate(&hrtc, &sdatestructure, RTC_FORMAT_BIN);
+    }
+
+    imu_time_offset = 0.0;
+    rtc_unix_sec = (double)time2Stamp(&sdatestructure, &stimestructure);
+    time_ms = rtc_unix_sec + imu_time_offset;
+    USART3_Receive_Flag = false;
+    (void)osMutexRelease(g_telemetryMutex);
+  }
 }
 
 static void handle_usart3_frame(void)
 {
-  if (!USART3_Receive_Flag)
-  {
-    return;
-  }
+  uint8_t frame[USART3_RX_CAPACITY];
+  uint16_t len;
+  uint16_t i;
+  uint32_t count;
 
-  usart3_forward_to_uart2();
-  sync_rtc_from_usart3();
+  if (USART3_Receive_Flag == true)
+  {
+    len = USART3_RxFrameLen;
+    count = (uint32_t)len;
+    if (count >= USART3_RX_CAPACITY)
+    {
+      count = USART3_RX_CAPACITY - 1U;
+      len = (uint16_t)count;
+    }
+    for (i = (uint16_t)0; i < len; i++)
+    {
+      frame[i] = USART3_Buff[i];
+    }
+    frame[len] = 0U;
+    usart3_forward_to_uart2(frame, len);
+    sync_rtc_from_usart3(frame, len);
+  }
 }
 
 static void vehicle_can_handle_frame(uint32_t can_id, const uint8_t *payload)
 {
-  switch (can_id)
+  if (payload != NULL)
   {
-  case CAN_ID_VEH_SPD_LGT:
-    vehicle_data.veh_speed = (float)payload[5] * 0.00391f;
-    can_update_count++;
-    break;
-  case CAN_ID_WHL_FRNT:
-    vehicle_data.whl_ft_l = (float)payload[1] * 0.00391f;
-    vehicle_data.whl_ft_r = (float)payload[5] * 0.00391f;
-    can_update_count++;
-    break;
-  case CAN_ID_WHL_REAR:
-    vehicle_data.whl_rr_l = (float)payload[3] * 0.00391f;
-    vehicle_data.whl_rr_r = (float)payload[7] * 0.00391f;
-    can_update_count++;
-    break;
-  case CAN_ID_STEER_WHL_AG:
-    /* SteerWhlAgSafe: byte layout/scale per vehicle DBC; adjust if needed. */
-    vehicle_data.steer = (float)payload[1];
-    can_update_count++;
-    break;
-  case CAN_ID_GEAR_LVR:
-    /* GearLvrIndcn: raw lever position in payload[0] (DBC-specific). */
-    vehicle_data.gear = (float)payload[0];
-    can_update_count++;
-    break;
-  default:
-    break;
+    switch (can_id)
+    {
+    case CAN_ID_VEH_SPD_LGT:
+      vehicle_data.veh_speed = u8_scaled(payload[CAN_BYTE_VEH_SPD]);
+      note_can_update();
+      break;
+    case CAN_ID_WHL_FRNT:
+      vehicle_data.whl_ft_l = u8_scaled(payload[CAN_BYTE_WHL_FL]);
+      vehicle_data.whl_ft_r = u8_scaled(payload[CAN_BYTE_WHL_FR]);
+      note_can_update();
+      break;
+    case CAN_ID_WHL_REAR:
+      vehicle_data.whl_rr_l = u8_scaled(payload[CAN_BYTE_WHL_RL]);
+      vehicle_data.whl_rr_r = u8_scaled(payload[CAN_BYTE_WHL_RR]);
+      note_can_update();
+      break;
+    case CAN_ID_STEER_WHL_AG:
+      vehicle_data.steer = u8_as_float(payload[CAN_BYTE_STEER]);
+      note_can_update();
+      break;
+    case CAN_ID_GEAR_LVR:
+      vehicle_data.gear = u8_as_float(payload[CAN_BYTE_GEAR]);
+      note_can_update();
+      break;
+    default:
+      break;
+    }
   }
 }
 
 static void publish_grimu_sentence(void)
 {
-  strcpy(grimu_sentence, "$GRIMU,");
-  sprintf(imu_field[0], "%.3f", time_ms);
-  sprintf(imu_field[1], "%.3f", scha63x_data.acc_x);
-  sprintf(imu_field[2], "%.3f", scha63x_data.acc_y);
-  sprintf(imu_field[3], "%.3f", scha63x_data.acc_z);
-  sprintf(imu_field[4], "%.3f", scha63x_data.gyro_x);
-  sprintf(imu_field[5], "%.3f", scha63x_data.gyro_y);
-  sprintf(imu_field[6], "%.3f", scha63x_data.gyro_z);
-  sprintf(imu_field[7], "%.3f", scha63x_data.temp_due);
+  uint8_t sentence[NMEA_SENTENCE_CAP];
+  uint32_t pos;
 
-  for (int i = 0; i < 8; i++)
-  {
-    strcat(grimu_sentence, imu_field[i]);
-    strcat(grimu_sentence, (i < 7) ? "," : "*");
-  }
-
-  xor_byte = CheckXOR(grimu_sentence);
-  (void)App_LogPrintf("%s%02x\r\n", grimu_sentence, xor_byte);
+  nmea_begin(sentence, NMEA_SENTENCE_CAP, &pos, "$GRIMU,");
+  append_float_field(sentence, NMEA_SENTENCE_CAP, &pos, time_ms, false);
+  append_float_field(sentence, NMEA_SENTENCE_CAP, &pos, f64_from_float(scha63x_data.acc_x), false);
+  append_float_field(sentence, NMEA_SENTENCE_CAP, &pos, f64_from_float(scha63x_data.acc_y), false);
+  append_float_field(sentence, NMEA_SENTENCE_CAP, &pos, f64_from_float(scha63x_data.acc_z), false);
+  append_float_field(sentence, NMEA_SENTENCE_CAP, &pos, f64_from_float(scha63x_data.gyro_x), false);
+  append_float_field(sentence, NMEA_SENTENCE_CAP, &pos, f64_from_float(scha63x_data.gyro_y), false);
+  append_float_field(sentence, NMEA_SENTENCE_CAP, &pos, f64_from_float(scha63x_data.gyro_z), false);
+  append_float_field(sentence, NMEA_SENTENCE_CAP, &pos, f64_from_float(scha63x_data.temp_due), true);
+  log_nmea(sentence, NMEA_SENTENCE_CAP, pos);
   imu_time_offset += 0.01;
   time_ms = rtc_unix_sec + imu_time_offset;
 }
 
 static void publish_grodo_sentence(void)
 {
-  /* $GRODO: time, FL, FR, RL, RR, longitudinal speed, gear */
-  strcpy(grodo_sentence, "$GRODO,");
-  sprintf(grodo_field[0], "%.3f", time_ms);
-  sprintf(grodo_field[1], "%.3f", vehicle_data.whl_ft_l);
-  sprintf(grodo_field[2], "%.3f", vehicle_data.whl_ft_r);
-  sprintf(grodo_field[3], "%.3f", vehicle_data.whl_rr_l);
-  sprintf(grodo_field[4], "%.3f", vehicle_data.whl_rr_r);
-  sprintf(grodo_field[5], "%.3f", vehicle_data.veh_speed);
-  sprintf(grodo_field[6], "%.3f", vehicle_data.gear);
+  uint8_t sentence[NMEA_SENTENCE_CAP];
+  uint32_t pos;
 
-  for (int i = 0; i < 7; i++)
-  {
-    strcat(grodo_sentence, grodo_field[i]);
-    strcat(grodo_sentence, (i < 6) ? "," : "*");
-  }
-
-  xor_byte = CheckXOR(grodo_sentence);
-  (void)App_LogPrintf("%s%02x\r\n", grodo_sentence, xor_byte);
-  can_update_count = 0;
+  nmea_begin(sentence, NMEA_SENTENCE_CAP, &pos, "$GRODO,");
+  append_float_field(sentence, NMEA_SENTENCE_CAP, &pos, time_ms, false);
+  append_float_field(sentence, NMEA_SENTENCE_CAP, &pos, f64_from_float(vehicle_data.whl_ft_l), false);
+  append_float_field(sentence, NMEA_SENTENCE_CAP, &pos, f64_from_float(vehicle_data.whl_ft_r), false);
+  append_float_field(sentence, NMEA_SENTENCE_CAP, &pos, f64_from_float(vehicle_data.whl_rr_l), false);
+  append_float_field(sentence, NMEA_SENTENCE_CAP, &pos, f64_from_float(vehicle_data.whl_rr_r), false);
+  append_float_field(sentence, NMEA_SENTENCE_CAP, &pos, f64_from_float(vehicle_data.veh_speed), false);
+  append_float_field(sentence, NMEA_SENTENCE_CAP, &pos, f64_from_float(vehicle_data.gear), true);
+  log_nmea(sentence, NMEA_SENTENCE_CAP, pos);
+  can_update_count = (uint8_t)0;
 }
 
 static void imu_sample_and_publish(void)
 {
-  scha63x_read_data(&scha63x_raw_data_last);
-  scha63x_data_summed_raw.acc_x_lsb = scha63x_raw_data_last.acc_x_lsb;
-  scha63x_data_summed_raw.acc_y_lsb = scha63x_raw_data_last.acc_y_lsb;
-  scha63x_data_summed_raw.acc_z_lsb = scha63x_raw_data_last.acc_z_lsb;
-  scha63x_data_summed_raw.gyro_x_lsb = scha63x_raw_data_last.gyro_x_lsb;
-  scha63x_data_summed_raw.gyro_y_lsb = scha63x_raw_data_last.gyro_y_lsb;
-  scha63x_data_summed_raw.gyro_z_lsb = scha63x_raw_data_last.gyro_z_lsb;
-  scha63x_data_summed_raw.temp_due_lsb = scha63x_raw_data_last.temp_due_lsb;
-  scha63x_data_summed_raw.temp_uno_lsb = scha63x_raw_data_last.temp_uno_lsb;
-  scha63x_convert_data(&scha63x_data_summed_raw, &scha63x_data);
+  scha63x_raw_data raw;
+  scha63x_raw_data_summed summed;
+
+  scha63x_read_data(&raw);
+  summed.acc_x_lsb = raw.acc_x_lsb;
+  summed.acc_y_lsb = raw.acc_y_lsb;
+  summed.acc_z_lsb = raw.acc_z_lsb;
+  summed.gyro_x_lsb = raw.gyro_x_lsb;
+  summed.gyro_y_lsb = raw.gyro_y_lsb;
+  summed.gyro_z_lsb = raw.gyro_z_lsb;
+  summed.temp_due_lsb = raw.temp_due_lsb;
+  summed.temp_uno_lsb = raw.temp_uno_lsb;
+  scha63x_convert_data(&summed, &scha63x_data);
   scha63x_cross_axis_compensation(&scha63x_data);
 
-  if (osMutexWait(g_telemetryMutex, osWaitForever) != osOK)
+  if (osMutexWait(g_telemetryMutex, osWaitForever) == osOK)
   {
-    return;
+    rtc_unix_sec = (double)time2Stamp(&sdatestructure, &stimestructure);
+    time_ms = rtc_unix_sec + imu_time_offset;
+    publish_grimu_sentence();
+    (void)osMutexRelease(g_telemetryMutex);
   }
-
-  rtc_unix_sec = (double)time2Stamp(sdatestructure, stimestructure);
-  time_ms = rtc_unix_sec + imu_time_offset;
-  publish_grimu_sentence();
-  (void)osMutexRelease(g_telemetryMutex);
 }
 
 void data_output(void const *argument)
@@ -358,64 +801,74 @@ void data_output(void const *argument)
 
   for (;;)
   {
-    if (osSemaphoreWait(g_usart3RxSem, 0) == osOK)
+    if (osSemaphoreWait(g_usart3RxSem, 0U) == osOK)
     {
       handle_usart3_frame();
     }
 
-    if (osSemaphoreWait(g_imuTickSem, 0) == osOK)
+    if (osSemaphoreWait(g_imuTickSem, 0U) == osOK)
     {
       imu_sample_and_publish();
     }
     else
     {
-      osDelay(1);
+      (void)osDelay(1U);
     }
   }
 }
 
 void work_state(void const *argument)
 {
+  (void)argument;
+
   for (;;)
   {
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
-    osDelay(500);
+    (void)osDelay(500U);
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
-    osDelay(500);
+    (void)osDelay(500U);
   }
 }
 
 void can_com(void const *argument)
 {
-  int publish_grodo = 0;
+  FDCAN_RxHeaderTypeDef rx_header;
+  uint8_t rx_data[8];
+  bool publish;
+  uint32_t fill;
 
   (void)argument;
 
   for (;;)
   {
-    if (osSemaphoreWait(g_canRxSem, osWaitForever) != osOK)
+    publish = false;
+    if (osSemaphoreWait(g_canRxSem, osWaitForever) == osOK)
     {
-      continue;
-    }
-
-    if (osMutexWait(g_vehicleDataMutex, osWaitForever) != osOK)
-    {
-      continue;
-    }
-
-    while (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) > 0U)
-    {
-      if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK)
+      if (osMutexWait(g_vehicleDataMutex, osWaitForever) == osOK)
       {
-        break;
+        fill = HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0);
+        while (fill > 0U)
+        {
+          if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &rx_header, rx_data) != HAL_OK)
+          {
+            fill = 0U;
+          }
+          else
+          {
+            vehicle_can_handle_frame(rx_header.Identifier, rx_data);
+            fill = HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0);
+          }
+        }
+
+        if (can_update_count >= GRODO_CAN_UPDATES_MIN)
+        {
+          publish = true;
+        }
+        (void)osMutexRelease(g_vehicleDataMutex);
       }
-      vehicle_can_handle_frame(RxHeader.Identifier, RxData);
     }
 
-    publish_grodo = (can_update_count >= (int)GRODO_CAN_UPDATES_MIN) ? 1 : 0;
-    (void)osMutexRelease(g_vehicleDataMutex);
-
-    if (publish_grodo)
+    if (publish == true)
     {
       if (osMutexWait(g_telemetryMutex, osWaitForever) == osOK)
       {
@@ -469,21 +922,27 @@ int main(void)
   MX_TIM17_Init();
   MX_FDCAN1_Init();
   /* USER CODE BEGIN 2 */
-  FDCAN1_Config();
-  HAL_TIM_Base_Start_IT(&htim16);
-  static char scha63x_serial_num[14];
-  status = scha63x_init(scha63x_serial_num);
-  // Initialize SCHA63X sensor
-  if (status != SCHA63X_OK)
   {
-    printf("\r\n IMU INIT fail!\r\n");
-  }
+    char scha63x_serial_num[14] = { '\0' };
+    int32_t imu_status;
 
-  HAL_Delay(1000);
+    FDCAN1_Config();
+    if (HAL_TIM_Base_Start_IT(&htim16) != HAL_OK)
+    {
+      Error_Handler();
+    }
+    imu_status = scha63x_init(scha63x_serial_num);
+    if (imu_status != SCHA63X_OK)
+    {
+      log_cstring("\r\n IMU INIT fail!\r\n");
+    }
+    HAL_Delay(1000U);
+  }
   /* USER CODE END 2 */
 
   MX_FREERTOS_Init();
   osKernelStart();
+  return 0;
 }
 
 /**
@@ -588,7 +1047,7 @@ static void FDCAN1_ConfigFilter(uint32_t index, uint32_t id)
   }
 }
 
-void FDCAN1_Config(void)
+static void FDCAN1_Config(void)
 {
   FDCAN1_ConfigFilter(0U, CAN_ID_STEER_WHL_AG);
   FDCAN1_ConfigFilter(1U, CAN_ID_WHL_FRNT);
@@ -608,7 +1067,7 @@ void FDCAN1_Config(void)
     Error_Handler();
   }
 
-  if (HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK)
+  if (HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0U) != HAL_OK)
   {
     Error_Handler();
   }
@@ -618,7 +1077,7 @@ void FDCAN1_Config(void)
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 {
   (void)hfdcan;
-  if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != RESET)
+  if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != 0U)
   {
     App_NotifyCanRxFromIsr();
   }
@@ -662,7 +1121,7 @@ void Error_Handler(void)
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
-  while (1)
+  for (;;)
   {
   }
   /* USER CODE END Error_Handler_Debug */
@@ -679,8 +1138,8 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  (void)file;
+  (void)line;
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */

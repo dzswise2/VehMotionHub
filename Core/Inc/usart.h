@@ -36,7 +36,7 @@ extern UART_HandleTypeDef huart2;
 extern UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN Private defines */
-
+#define USART3_RX_CAPACITY (300U)
 /* USER CODE END Private defines */
 
 void MX_USART1_UART_Init(void);
@@ -44,12 +44,9 @@ void MX_USART2_UART_Init(void);
 void MX_USART3_UART_Init(void);
 
 /* USER CODE BEGIN Prototypes */
-extern uint8_t USART3_Buff[300];            /* USART3 RX frame buffer */
-extern uint8_t imu_data[100];
-extern uint8_t USART3_STA;
+extern volatile uint8_t USART3_Buff[USART3_RX_CAPACITY];
 extern volatile uint16_t USART3_RxFrameLen;
-extern bool USART3_Receive_Flag;
-extern uint8_t res;
+extern volatile bool USART3_Receive_Flag;
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus

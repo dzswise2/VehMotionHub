@@ -22,15 +22,15 @@
 #include "app_rtos.h"
 
 /* USER CODE BEGIN 0 */
+#define USART3_FRAME_CR_MARK ((uint8_t)3)
 
-uint8_t USART3_Buff[300] = {0};
-uint8_t USART3_STA = 0;
-volatile uint16_t USART3_RxFrameLen = 0;
-bool USART3_Receive_Flag = false;
-uint8_t res              = 0;
-int Uart3_Rx_Cnt         = 0;
-uint8_t cnt = 0;
-uint8_t imu_data[100];
+volatile uint8_t USART3_Buff[USART3_RX_CAPACITY];
+volatile uint16_t USART3_RxFrameLen = (uint16_t)0;
+volatile bool USART3_Receive_Flag = false;
+
+static uint8_t s_usart3_rx_byte = (uint8_t)0;
+static volatile uint16_t s_usart3_sta = (uint16_t)0;
+static volatile uint8_t s_usart3_cr_count = (uint8_t)0;
 /* USER CODE END 0 */
 
 UART_HandleTypeDef huart1;
@@ -137,7 +137,10 @@ void MX_USART3_UART_Init(void)
   {
     Error_Handler();
   }
-  HAL_UART_Receive_IT(&huart3,&res,1);      // 重新使能串口3接收中断
+  if (HAL_UART_Receive_IT(&huart3, &s_usart3_rx_byte, (uint16_t)1) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
 void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
@@ -285,37 +288,52 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
 /* USER CODE BEGIN 1 */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-    if (huart3.Instance == USART3)
+  uint16_t filled;
+  uint32_t index;
+
+  if ((huart != NULL) && (huart->Instance == USART3))
+  {
+    if (s_usart3_rx_byte == (uint8_t)'\r')
     {
-        /* Third CR in one burst marks end of NMEA/time sentence from USART3 */
-        if (res == '\r')
-        {
-          cnt++;
-        }
-        if ((cnt == 3) && (USART3_Receive_Flag == false))
-        {
-          USART3_RxFrameLen = USART3_STA;
-          USART3_Buff[USART3_STA] = 0;
-          USART3_STA = 0;
-          cnt = 0;
-          USART3_Receive_Flag = true;
-          App_NotifyUsart3FrameFromIsr();
-        }
-        else if (USART3_Receive_Flag == false)
-        {
-            if (USART3_STA < (sizeof(USART3_Buff) - 1U))
-            {
-              USART3_Buff[USART3_STA] = res;
-              USART3_STA++;
-            }
-            else
-            {
-              USART3_STA = 0;
-            }
-        }
-        HAL_UART_Receive_IT(&huart3, &res, 1);
+      s_usart3_cr_count++;
     }
 
+    if ((s_usart3_cr_count == USART3_FRAME_CR_MARK) && (USART3_Receive_Flag == false))
+    {
+      filled = s_usart3_sta;
+      USART3_RxFrameLen = filled;
+      index = (uint32_t)filled;
+      if (index < USART3_RX_CAPACITY)
+      {
+        USART3_Buff[index] = 0U;
+      }
+      s_usart3_sta = (uint16_t)0;
+      s_usart3_cr_count = (uint8_t)0;
+      USART3_Receive_Flag = true;
+      App_NotifyUsart3FrameFromIsr();
+    }
+    else if (USART3_Receive_Flag == false)
+    {
+      filled = s_usart3_sta;
+      index = (uint32_t)filled;
+      if (index < (USART3_RX_CAPACITY - 1U))
+      {
+        USART3_Buff[index] = s_usart3_rx_byte;
+        index++;
+        s_usart3_sta = (uint16_t)index;
+      }
+      else
+      {
+        s_usart3_sta = (uint16_t)0;
+      }
+    }
+    else
+    {
+      /* Previous frame is still being consumed. */
+    }
+
+    (void)HAL_UART_Receive_IT(&huart3, &s_usart3_rx_byte, (uint16_t)1);
+  }
 }
 
 /* USER CODE END 1 */

@@ -30,9 +30,18 @@ static StackType_t xIdleStack[configMINIMAL_STACK_SIZE];
 
 void vApplicationGetIdleTaskMemory( StaticTask_t **ppxIdleTaskTCBBuffer, StackType_t **ppxIdleTaskStackBuffer, uint32_t *pulIdleTaskStackSize )
 {
-  *ppxIdleTaskTCBBuffer = &xIdleTaskTCBBuffer;
-  *ppxIdleTaskStackBuffer = &xIdleStack[0];
-  *pulIdleTaskStackSize = configMINIMAL_STACK_SIZE;
+  if (ppxIdleTaskTCBBuffer != NULL)
+  {
+    *ppxIdleTaskTCBBuffer = &xIdleTaskTCBBuffer;
+  }
+  if (ppxIdleTaskStackBuffer != NULL)
+  {
+    *ppxIdleTaskStackBuffer = &xIdleStack[0];
+  }
+  if (pulIdleTaskStackSize != NULL)
+  {
+    *pulIdleTaskStackSize = configMINIMAL_STACK_SIZE;
+  }
 }
 /* USER CODE END GET_IDLE_TASK_MEMORY */
 
@@ -51,4 +60,11 @@ void MX_FREERTOS_Init(void)
   dataOutTaskHandle = osThreadCreate(osThread(dataOutTask), NULL);
   canComTaskHandle = osThreadCreate(osThread(canComTask), NULL);
   workTaskHandle = osThreadCreate(osThread(workTask), NULL);
+
+  if ((dataOutTaskHandle == NULL) ||
+      (canComTaskHandle == NULL) ||
+      (workTaskHandle == NULL))
+  {
+    Error_Handler();
+  }
 }

@@ -1,7 +1,8 @@
 #include "app_rtos.h"
+#include "main.h"
 #include "usart.h"
-#include <stdarg.h>
-#include <stdio.h>
+
+#define APP_LOG_CAPACITY (160U)
 
 osMutexId g_vehicleDataMutex;
 osMutexId g_telemetryMutex;
@@ -19,20 +20,7 @@ osSemaphoreDef(CanRxSem);
 osSemaphoreDef(Usart3RxSem);
 osSemaphoreDef(ImuTickSem);
 
-void App_RtosInitObjects(void)
-{
-  g_vehicleDataMutex = osMutexCreate(osMutex(VehicleDataMutex));
-  g_telemetryMutex = osMutexCreate(osMutex(TelemetryMutex));
-  g_logMutex = osMutexCreate(osMutex(LogMutex));
-
-  /* Start at 0; ISR gives tokens when events occur. CAN uses counting sem for bursts. */
-  /* CMSIS wrapper: count==1 creates an empty binary semaphore. */
-  g_canRxSem = osSemaphoreCreate(osSemaphore(CanRxSem), 1);
-  g_usart3RxSem = osSemaphoreCreate(osSemaphore(Usart3RxSem), 1);
-  g_imuTickSem = osSemaphoreCreate(osSemaphore(ImuTickSem), 1);
-}
-
-void App_LogLock(void)
+static void App_LogLock(void)
 {
   if (g_logMutex != NULL)
   {
@@ -40,7 +28,7 @@ void App_LogLock(void)
   }
 }
 
-void App_LogUnlock(void)
+static void App_LogUnlock(void)
 {
   if (g_logMutex != NULL)
   {
@@ -48,31 +36,50 @@ void App_LogUnlock(void)
   }
 }
 
-int App_LogPrintf(const char *fmt, ...)
+void App_RtosInitObjects(void)
 {
-  char line[160];
-  va_list args;
-  int len;
+  /* CMSIS: count == 1 creates an empty binary semaphore. */
+  g_vehicleDataMutex = osMutexCreate(osMutex(VehicleDataMutex));
+  g_telemetryMutex = osMutexCreate(osMutex(TelemetryMutex));
+  g_logMutex = osMutexCreate(osMutex(LogMutex));
+  g_canRxSem = osSemaphoreCreate(osSemaphore(CanRxSem), (int32_t)1);
+  g_usart3RxSem = osSemaphoreCreate(osSemaphore(Usart3RxSem), (int32_t)1);
+  g_imuTickSem = osSemaphoreCreate(osSemaphore(ImuTickSem), (int32_t)1);
 
-  va_start(args, fmt);
-  len = vsnprintf(line, sizeof(line), fmt, args);
-  va_end(args);
-
-  if (len <= 0)
+  if ((g_vehicleDataMutex == NULL) ||
+      (g_telemetryMutex == NULL) ||
+      (g_logMutex == NULL) ||
+      (g_canRxSem == NULL) ||
+      (g_usart3RxSem == NULL) ||
+      (g_imuTickSem == NULL))
   {
-    return len;
+    Error_Handler();
   }
+}
 
-  if ((size_t)len >= sizeof(line))
+void App_LogWrite(const uint8_t *data, uint16_t length)
+{
+  uint8_t local[APP_LOG_CAPACITY];
+  uint16_t i;
+  uint16_t n;
+
+  if ((data != NULL) && (length > (uint16_t)0))
   {
-    len = (int)sizeof(line) - 1;
+    n = length;
+    if (n > (uint16_t)APP_LOG_CAPACITY)
+    {
+      n = (uint16_t)APP_LOG_CAPACITY;
+    }
+
+    for (i = (uint16_t)0; i < n; i++)
+    {
+      local[i] = data[i];
+    }
+
+    App_LogLock();
+    (void)HAL_UART_Transmit(&huart1, local, n, 0xFFFFU);
+    App_LogUnlock();
   }
-
-  App_LogLock();
-  (void)HAL_UART_Transmit(&huart1, (uint8_t *)line, (uint16_t)len, 0xFFFF);
-  App_LogUnlock();
-
-  return len;
 }
 
 void App_NotifyCanRxFromIsr(void)
